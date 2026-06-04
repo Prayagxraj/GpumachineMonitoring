@@ -3,6 +3,7 @@ import pandas as pd
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import warnings
+import requests
 
 # Suppress SQLAlchemy and dateutil warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -19,10 +20,13 @@ team_members = ["Prayag Raj", "Snigdh Chamoli", "Eisha rawat", "Pranshul Pandey"
 
 try:
     DB_CONFIG = st.secrets["postgres"]
+    # THE FIX: Pointing these to the [paperspace] section in your secrets.toml
+    PAPERSPACE_API_KEY = st.secrets["paperspace"]["PAPERSPACE_API_KEY"]
+    MACHINE_ID = st.secrets["paperspace"]["MACHINE_ID"]
 except Exception:
     st.error(
-        "No Streamlit secrets were found. Create `.streamlit/secrets.toml` with a [postgres] section, "
-        "or copy `.streamlit/secrets.toml.example` and fill in your database credentials."
+        "Missing Streamlit secrets. Ensure `.streamlit/secrets.toml` contains [postgres], "
+        "and a [paperspace] section with PAPERSPACE_API_KEY and MACHINE_ID."
     )
     st.stop()
 
@@ -62,7 +66,6 @@ def append_event(user_name: str, action: str, status: str):
         conn.commit()
 
 def load_history(limit: int = 100) -> pd.DataFrame:
-    # Increased limit to ensure we fetch enough history to find everyone's latest action
     query = "SELECT user_name, action, created_at, status FROM machine_events ORDER BY created_at DESC, id DESC LIMIT %s"
     
     with get_db_connection() as conn:
@@ -70,14 +73,10 @@ def load_history(limit: int = 100) -> pd.DataFrame:
             cursor.execute(query, (limit,))
             rows = cursor.fetchall()
     
-    # If no rows, return empty DataFrame with correct columns
     if not rows:
         return pd.DataFrame(columns=['Name', 'Action', 'Timestamp', 'Status'])
     
-    # Convert RealDictCursor rows to DataFrame directly
     df = pd.DataFrame(rows)
-    
-    # Rename columns to match expected UI format
     df = df.rename(columns={
         'user_name': 'Name',
         'action': 'Action',
@@ -85,13 +84,9 @@ def load_history(limit: int = 100) -> pd.DataFrame:
         'status': 'Status'
     })
     
-    # Parse Timestamp, convert to local IST time, and format to AM/PM
     if 'Timestamp' in df.columns:
-        # 1. Parse raw UTC time from database
-        timestamps = pd.to_datetime(df['Timestamp'], format='mixed', errors='coerce')
-        # 2. Convert to Indian Standard Time (IST)
+        timestamps = pd.to_datetime(df['Timestamp'], format='mixed', errors='coerce', utc=True)
         timestamps = timestamps.dt.tz_convert('Asia/Kolkata')
-        # 3. Format to readable AM/PM string
         df['Timestamp'] = timestamps.dt.strftime('%b %d, %I:%M %p') 
     
     return df
@@ -113,6 +108,36 @@ def get_record_count():
             row = cursor.fetchone()
     return row["count"] if row else 0
 
+def start_machine(user_name: str):
+    url = f"https://api.paperspace.io/machines/{MACHINE_ID}/start"
+    headers = {
+        "x-api-key": PAPERSPACE_API_KEY
+    }
+    try:
+        response = requests.post(url, headers=headers)
+        if response.status_code in [200, 204]:
+            st.success(f"✅ Machine started successfully by {user_name}!")
+            append_event(user_name, "Machine Start", "Booting")
+        else:
+            st.error(f"❌ Failed to start. Status: {response.status_code} - {response.text}")
+    except Exception as e:
+        st.error(f"Error starting machine: {str(e)}")
+
+def stop_machine(user_name: str):
+    url = f"https://api.paperspace.io/machines/{MACHINE_ID}/stop"
+    headers = {
+        "x-api-key": PAPERSPACE_API_KEY
+    }
+    try:
+        response = requests.post(url, headers=headers)
+        if response.status_code in [200, 204]:
+            st.success(f"✅ Machine stopped successfully by {user_name}!")
+            append_event(user_name, "Machine Stop", "Shutting Down")
+        else:
+            st.error(f"❌ Failed to stop. Status: {response.status_code} - {response.text}")
+    except Exception as e:
+        st.error(f"Error stopping machine: {str(e)}")
+
 def on_toggle_change(member: str):
     """Callback when a toggle is changed."""
     toggle_key = f"toggle_{member}"
@@ -122,7 +147,6 @@ def on_toggle_change(member: str):
         if current_state:
             append_event(member, "Check In", "In Use")
         else:
-            # Changed from "Available" to "Offline" for better readability
             append_event(member, "Check Out", "Offline")
     except Exception as e:
         st.error(f"Error saving event for {member}: {str(e)}")
@@ -130,14 +154,9 @@ def on_toggle_change(member: str):
 def execute_daily_reset():
     """Callback for the End of Day Reset button to safely update UI state."""
     try:
-        # Clear the database
         reset_database()
-        
-        # Reset all toggles in the UI to OFF
         for member in team_members:
             st.session_state[f"toggle_{member}"] = False
-            
-        # Set a flag so we know to show a success message
         st.session_state['show_reset_success'] = True
     except Exception as e:
         st.session_state['reset_error'] = e
@@ -156,6 +175,40 @@ for member in team_members:
     if toggle_key not in st.session_state:
         st.session_state[toggle_key] = False
 
+# --- GPU MACHINE CONTROLS SECTION ---
+st.markdown("---")
+st.subheader("🖥️ GPU Machine Controls")
+st.write("Start or stop the shared Paperspace machine directly from here.")
+
+action_user = st.selectbox("Select your name to authorize machine action:", team_members, key="action_user")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    if st.button("🟢 Start Machine", use_container_width=True):
+        start_machine(action_user)
+
+with col2:
+    if st.button("🔴 Stop Machine", use_container_width=True):
+        st.session_state.confirm_stop = True
+
+if st.session_state.get("confirm_stop", False):
+    st.warning(f"⚠️ **{action_user}**, are you sure you want to stop the machine? Ensure no one else is running jobs.")
+    conf_col1, conf_col2 = st.columns(2)
+    
+    with conf_col1:
+        if st.button("✔️ Yes, Stop it", type="primary", use_container_width=True):
+            stop_machine(action_user)
+            st.session_state.confirm_stop = False
+            st.rerun()
+            
+    with conf_col2:
+        if st.button("❌ Cancel", use_container_width=True):
+            st.session_state.confirm_stop = False
+            st.rerun()
+
+st.markdown("---")
+
 st.subheader("User Status Toggles")
 st.write("Toggle ON to check in, Toggle OFF to check out:")
 
@@ -165,7 +218,6 @@ for idx, member in enumerate(team_members):
     with cols[idx]:
         st.toggle(member, key=toggle_key, on_change=on_toggle_change, args=(member,))
 
-# Count active users
 active_users = [member for member in team_members if st.session_state.get(f"toggle_{member}", False)]
 
 st.markdown("---")
@@ -192,7 +244,6 @@ with col1:
 with col2:
     st.button("🔄 End of Day Reset", on_click=execute_daily_reset)
     
-# Check flags to show success or error messages after the page reloads
 if st.session_state.pop('show_reset_success', False):
     st.success("Database and toggles reset successfully! Ready for a fresh day.")
     
@@ -200,37 +251,32 @@ if 'reset_error' in st.session_state:
     st.error("Unable to perform the reset.")
     st.exception(st.session_state.pop('reset_error'))
 
+# Initialize fallback DataFrame to completely guard against NameErrors
+history_df = pd.DataFrame(columns=['Name', 'Action', 'Timestamp', 'Status'])
+
 # Load and display history Dashboard
 try:
     history_df = load_history(100)
     
-    # Create a clean summary table for the predefined names
     summary_data = []
-    
     for member in team_members:
-        # Determine current status based on the toggle switch
         is_active = st.session_state.get(f"toggle_{member}", False)
         status_icon = "🔴 In Use" if is_active else "🟢 Offline"
         
-        # Default empty times
         last_check_in = "--"
         last_check_out = "--"
         
         if not history_df.empty:
-            # Get all logs for this specific person
             member_logs = history_df[history_df['Name'] == member]
             
-            # Find their most recent Check In
             check_ins = member_logs[member_logs['Action'] == 'Check In']
             if not check_ins.empty:
                 last_check_in = check_ins.iloc[0]['Timestamp']
                 
-            # Find their most recent Check Out
             check_outs = member_logs[member_logs['Action'] == 'Check Out']
             if not check_outs.empty:
                 last_check_out = check_outs.iloc[0]['Timestamp']
         
-        # Append to our new predefined table
         summary_data.append({
             "Name": member,
             "Current Status": status_icon,
@@ -238,21 +284,23 @@ try:
             "Last Check Out": last_check_out
         })
         
-    # Convert to DataFrame and Display the clean Dashboard
     summary_df = pd.DataFrame(summary_data)
     st.dataframe(summary_df, width='stretch', hide_index=True)
 
     st.caption("This app uses PostgreSQL for shared persistent storage. When you toggle ON, a 'Check In' event is recorded. When you toggle OFF, a 'Check Out' event is recorded.")
 
-    # Keep an expander to view the raw database logs if you ever need to debug
-    with st.expander("🔍 View Raw Event Logs & DB Info"):
-        st.write(f"**Total records in database:** {get_record_count()}")
-        st.write(f"Displaying last {len(history_df)} raw records:")
-        st.dataframe(history_df, width='stretch', hide_index=True)
-
 except Exception as exc:
     st.error("❌ Unable to load team dashboard.")
     st.exception(exc)
+
+# Expander is now safe from crashing because history_df is guaranteed to exist
+with st.expander("🔍 View Raw Event Logs & DB Info"):
+    try:
+        st.write(f"**Total records in database:** {get_record_count()}")
+        st.write(f"Displaying last {len(history_df)} raw records:")
+        st.dataframe(history_df, width='stretch', hide_index=True)
+    except Exception as exc:
+        st.error("Could not fetch raw log metrics.")
 
 # Debug section
 with st.expander("🔧 Debug Info"):
