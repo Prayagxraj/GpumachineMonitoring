@@ -300,7 +300,7 @@ try:
     summary_data = []
     for member in team_members:
         is_active = st.session_state.get(f"toggle_{member}", False)
-        status_icon = "🔴 In Use" if is_active else "🟢 Offline"
+        status_icon = "🟢 In Use" if is_active else " 🔴 Offline"
         
         last_check_in = "--"
         last_check_out = "--"
