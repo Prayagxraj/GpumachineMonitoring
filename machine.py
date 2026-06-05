@@ -4,6 +4,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import warnings
 import requests
+import time
 
 # Suppress SQLAlchemy and dateutil warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -11,6 +12,15 @@ warnings.filterwarnings("ignore", message=".*SQLAlchemy.*")
 warnings.filterwarnings("ignore", message=".*dateutil.*")
 
 st.set_page_config(page_title="Paperspace Machine Manager", layout="wide")
+
+# Auto-refresh: rerun the app every 3 seconds to sync with other users
+if "last_refresh" not in st.session_state:
+    st.session_state.last_refresh = time.time()
+
+current_time = time.time()
+if current_time - st.session_state.last_refresh > 3:  # Refresh every 3 seconds
+    st.session_state.last_refresh = current_time
+    st.rerun()
 
 st.title("Paperspace Machine Manager")
 st.markdown("### Shared Paperspace GPU Machine Tracker")
@@ -138,6 +148,27 @@ def stop_machine(user_name: str):
     except Exception as e:
         st.error(f"Error stopping machine: {str(e)}")
 
+def get_current_user_state(member: str) -> bool:
+    """Get the current state of a user from the database (most recent event)."""
+    query = """
+    SELECT status FROM machine_events 
+    WHERE user_name = %s 
+    ORDER BY created_at DESC, id DESC 
+    LIMIT 1
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, (member,))
+                row = cursor.fetchone()
+        
+        if row:
+            # "In Use" means toggle is ON, anything else means toggle is OFF
+            return row["status"] == "In Use"
+        return False
+    except Exception:
+        return False
+
 def on_toggle_change(member: str):
     """Callback when a toggle is changed."""
     toggle_key = f"toggle_{member}"
@@ -169,11 +200,13 @@ except Exception as exc:
     st.exception(exc)
     st.stop()
 
-# Initialize toggle states in session_state
+# Initialize toggle states from database (not hardcoded to False)
 for member in team_members:
     toggle_key = f"toggle_{member}"
     if toggle_key not in st.session_state:
-        st.session_state[toggle_key] = False
+        # Load the actual state from the database
+        db_state = get_current_user_state(member)
+        st.session_state[toggle_key] = db_state
 
 # --- GPU MACHINE CONTROLS SECTION ---
 st.markdown("---")
@@ -211,6 +244,12 @@ st.markdown("---")
 
 st.subheader("User Status Toggles")
 st.write("Toggle ON to check in, Toggle OFF to check out:")
+
+# Refresh toggle states from database before displaying
+for member in team_members:
+    toggle_key = f"toggle_{member}"
+    db_state = get_current_user_state(member)
+    st.session_state[toggle_key] = db_state
 
 cols = st.columns(len(team_members))
 for idx, member in enumerate(team_members):
